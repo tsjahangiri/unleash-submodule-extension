@@ -1,0 +1,24 @@
+# submodule-workflow.wf
+# Challenge 1 fix: orchestrate submodule releases
+
+checkSubmoduleVersions
+storeScmRevision
+checkProjectVersions
+checkParentVersions
+checkDependencies
+checkPlugins
+checkPluginDependencies
+prepareVersions
+checkAether
+setReleaseVersions
+addSpyPlugin
+buildReleaseArtifacts
+removeSpyPlugin
+checkForScmChanges
+tagScm
+detectReleaseArtifacts
+setDevVersion
+serializeMetadata
+installArtifacts
+deployArtifacts
+orchestrateSubmodules

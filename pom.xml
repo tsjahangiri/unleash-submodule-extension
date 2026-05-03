@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.poc.unleash</groupId>
+    <artifactId>unleash-submodule-extension</artifactId>
+    <version>1.0.6</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <java.version>11</java.version>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+    </properties>
+
+    <dependencies>
+
+        <!--
+            THE KEY DEPENDENCY — this is what the plugin actually uses.
+            Version comes directly from the real pom.xml source:
+            version.cdi-plugin-utils = 4.0.1
+            groupId = io.github.mavenplugins (NOT the old shillner one)
+        -->
+        <dependency>
+            <groupId>io.github.mavenplugins</groupId>
+            <artifactId>cdi-plugin-utils</artifactId>
+            <version>4.0.1</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+            The plugin itself — gives access to:
+            - ReleaseMetadata
+            - ScmProviderRegistry
+            - All existing step classes
+        -->
+        <dependency>
+            <groupId>io.github.mavenplugins</groupId>
+            <artifactId>unleash-maven-plugin</artifactId>
+            <version>3.3.0</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+            Maven project API — for MavenProject injection
+        -->
+        <dependency>
+            <groupId>org.apache.maven</groupId>
+            <artifactId>maven-core</artifactId>
+            <version>3.8.1</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- CDI API — for @Inject, @Named annotations -->
+        <dependency>
+            <groupId>jakarta.inject</groupId>
+            <artifactId>jakarta.inject-api</artifactId>
+            <version>2.0.1</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.maven.shared</groupId>
+            <artifactId>maven-invoker</artifactId>
+            <version>3.1.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.eclipse.jgit</groupId>
+            <artifactId>org.eclipse.jgit</artifactId>
+            <version>5.13.3.202401111512-r</version>
+            <scope>provided</scope>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+                REQUIRED: CDI bean discovery needs this marker file.
+                The real plugin has META-INF/beans.xml — your extension needs it too.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.3.0</version>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
