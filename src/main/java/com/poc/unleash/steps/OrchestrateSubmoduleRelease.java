@@ -33,43 +33,67 @@ import java.util.Properties;
  * ─────────────────────────────────────────────────────────────────
  * WHAT PROBLEM DOES THIS SOLVE?
  * ─────────────────────────────────────────────────────────────────
- * Normally, unleash only sees one Git repo at a time. In a multi-repo
- * setup (where repos are linked via Git submodules), you'd have to
- * manually trigger unleash in each repo in the correct order.
+ * The standard unleash-maven-plugin only sees one Git repo at a time.
+ * In a multi-repo setup (repos linked via Git submodules), a developer
+ * would normally have to manually trigger unleash in each repo in the
+ * correct dependency order, updating pom.xml files in between.
  *
- * This step automates that: run unleash once from poc-util, and it
- * automatically releases all dependent submodules first.
+ * This step automates the entire process: run unleash once from any
+ * module, and it automatically:
+ *   1. Releases all downstream submodules in order
+ *   2. Updates cross-repo dependency versions before each release
+ *   3. Bumps downstream poms to the new dev SNAPSHOT after each release
  *
  * ─────────────────────────────────────────────────────────────────
- * HOW IT WORKS (high level)
+ * EXECUTION FLOW
  * ─────────────────────────────────────────────────────────────────
- * 1. Read .gitmodules from the parent directory to discover all submodules
- * 2. Skip the current project (we are already releasing it)
- * 3. For each other submodule that still has a SNAPSHOT version:
- *    a. Trigger mvn unleash:perform on it via Maven Invoker
- *    b. After it succeeds, update any pom.xml files that referenced
- *       it as a SNAPSHOT — replace with the new release version
- *    c. Commit and push those pom updates so the next release sees clean state
+ * 1. Read .gitmodules to discover all submodules
+ * 2. Skip upstream modules (listed before current in .gitmodules)
+ * 3. Skip self (current project)
+ * 4. For each downstream submodule still on SNAPSHOT:
+ *    a. PRE-RELEASE:  replace its SNAPSHOT sibling deps with release versions
+ *    b. RELEASE:      trigger mvn unleash:perform via Maven Invoker
+ *    c. POST-RELEASE: update all other modules to reference the new dev SNAPSHOT
+ *
+ * ─────────────────────────────────────────────────────────────────
+ * UPSTREAM vs DOWNSTREAM
+ * ─────────────────────────────────────────────────────────────────
+ * The order of modules in .gitmodules defines the dependency direction:
+ *   poc-util (index 0) → poc-service (index 1) → poc-api (index 2)
+ *
+ * Running from poc-util (index 0): orchestrates poc-service, poc-api
+ * Running from poc-service (index 1): orchestrates poc-api only
+ * Running from poc-api (index 2): orchestrates nothing
+ *
+ * This prevents a downstream module from accidentally re-releasing an
+ * upstream dependency that is already on its own SNAPSHOT version.
  *
  * ─────────────────────────────────────────────────────────────────
  * INFINITE LOOP PREVENTION
  * ─────────────────────────────────────────────────────────────────
  * When this step triggers poc-service, poc-service also has this step
- * in its workflow. To prevent poc-service from triggering everything
- * again, we pass an environment variable UNLEASH_ORCHESTRATED=true
- * to the child Maven process. At the top of execute(), if that flag
- * is present, we immediately return — so child processes just release
- * themselves without orchestrating further.
+ * in its workflow. To prevent poc-service from orchestrating again,
+ * we set an environment variable UNLEASH_ORCHESTRATED=true on every
+ * child Maven process. If that flag is present at the top of execute(),
+ * we immediately return — child processes just release themselves.
  *
  * Why env var and not a Maven property (-D)?
  * Maven properties set via Invoker.setProperties() become Maven user
  * properties, NOT JVM system properties. System.getProperty() cannot
- * read them. Environment variables are reliably inherited by the child
- * JVM process — that's why System.getenv() works correctly here.
+ * read them in a forked JVM. Environment variables are reliably
+ * inherited by child processes — that is why System.getenv() works.
+ *
+ * ─────────────────────────────────────────────────────────────────
+ * FULLY AUTOMATIC VERSION MANAGEMENT
+ * ─────────────────────────────────────────────────────────────────
+ * After each submodule releases, unleash bumps it to the next dev
+ * SNAPSHOT (e.g. 1.0.6 → 1.0.7-SNAPSHOT). This step reads that new
+ * version from the pom and immediately pushes it to all downstream
+ * modules — so no manual pom updates are ever needed between cycles.
  */
 @ProcessingStep(
         id = "orchestrateSubmodules",
-        description = "Triggers unleash:perform on each submodule, then updates cross-repo pom dependencies",
+        description = "Releases downstream submodules in order, manages cross-repo versions automatically",
         requiresOnline = true
 )
 public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
@@ -79,15 +103,15 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
 
     /**
      * Gives us the base directory of the project unleash is currently running on.
-     * Used to find the parent folder and locate .gitmodules.
+     * Used to locate the parent folder and .gitmodules file.
      */
     @Inject
     private MavenProject project;
 
     /**
-     * SCM credentials injected by unleash from the user's command line
-     * (-Dunleash.scmUsername / -Dunleash.scmPassword).
-     * Passed through to child Maven Invoker calls and JGit push operations.
+     * SCM credentials injected from the user's command line:
+     *   -Dunleash.scmUsername=... -Dunleash.scmPassword=...
+     * Forwarded to child Maven Invoker calls and JGit push operations.
      */
     @Inject
     @Named("scmUsername")
@@ -102,9 +126,9 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
             throws MojoExecutionException, MojoFailureException {
 
         // ── INFINITE LOOP GUARD ──────────────────────────────────────────
-        // If this process was triggered BY an orchestrator (not by the user
-        // directly), skip orchestration entirely — just release this module.
-        // The env var is set inside triggerRelease() when invoking child Maven.
+        // Child processes triggered by this step have UNLEASH_ORCHESTRATED=true
+        // set on their environment. If we detect it, skip orchestration and
+        // just release this module — prevents recursive triggering.
         String orchestrated = System.getenv("UNLEASH_ORCHESTRATED");
         if ("true".equals(orchestrated)) {
             this.log.info("=== Skipping orchestration — already triggered by orchestrator ===");
@@ -122,7 +146,7 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
             return;
         }
 
-        // Use canonical path (fully resolved, no symlinks) for reliable self-detection
+        // Canonical path resolves symlinks and relative segments for reliable comparison
         String currentAbsPath;
         try {
             currentAbsPath = currentDir.getCanonicalPath();
@@ -139,9 +163,10 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
         List<String> skipped  = new ArrayList<>();
 
         // ── FIND CURRENT MODULE INDEX ────────────────────────────────────
-        // We only orchestrate modules listed AFTER us in .gitmodules.
-        // Modules listed before us are upstream dependencies — they must
-        // not be re-released by a downstream module's orchestration run.
+        // The position of the current module in .gitmodules determines which
+        // other modules are upstream (before) vs downstream (after).
+        // We only release downstream modules — upstream ones are dependencies
+        // that either already released themselves or are not our responsibility.
         int currentIndex = -1;
         for (int i = 0; i < submodulePaths.size(); i++) {
             File candidate = new File(parentDir, submodulePaths.get(i).trim());
@@ -171,10 +196,9 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
             }
 
             // ── UPSTREAM SKIP ────────────────────────────────────────────
-            // Modules listed before the current module are upstream dependencies.
-            // They should already be released — do not re-release them.
-            // Example: running from poc-service (index 1) must not re-release
-            // poc-util (index 0) even if poc-util is still on a SNAPSHOT version.
+            // Modules at a lower index are upstream dependencies — skip them.
+            // Example: poc-service (index 1) must NOT re-release poc-util
+            // (index 0) even if poc-util is currently on a SNAPSHOT version.
             if (i < currentIndex) {
                 this.log.info("  ⏭  Skipping [" + path
                         + "] — upstream dependency (index " + i
@@ -184,6 +208,8 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
             }
 
             // ── SELF-SKIP ────────────────────────────────────────────────
+            // Use canonical path comparison — safer than string comparison
+            // because .gitmodules may format paths as ./poc-util vs poc-util.
             if (submoduleAbsPath.equals(currentAbsPath)) {
                 this.log.info("  ⏭  Skipping [" + path
                         + "] — this is the current project (self).");
@@ -199,6 +225,8 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
             }
 
             // ── ALREADY RELEASED? ────────────────────────────────────────
+            // If the pom.xml has no -SNAPSHOT it is already on a release
+            // version — nothing to do for this module.
             if (!needsRelease(submodulePom)) {
                 this.log.info("  ⏭  Skipping [" + path
                         + "] — already at release version.");
@@ -206,13 +234,24 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
                 continue;
             }
 
-            // ── RELEASE ──────────────────────────────────────────────────
+            // ── PRE-RELEASE: CLEAN SNAPSHOT DEPS ─────────────────────────
+            // Before releasing, replace any sibling SNAPSHOT dependencies in
+            // this module's pom with their computed release versions.
+            // Unleash's checkDependencies step rejects SNAPSHOT deps — so this
+            // must happen before triggerRelease().
             this.log.info("  🚀 Releasing submodule: " + path);
             updateSubmoduleDepsBeforeRelease(submoduleDir, submodulePaths, parentDir);
+
+            // ── RELEASE ──────────────────────────────────────────────────
             triggerRelease(submoduleDir);
             released.add(path);
             this.log.info("  ✅ Done: " + path);
 
+            // ── POST-RELEASE: PUSH NEW DEV SNAPSHOT TO DOWNSTREAM ────────
+            // After release, unleash bumps this module to its next dev SNAPSHOT
+            // (e.g. 1.0.6 → 1.0.7-SNAPSHOT). We immediately read that new
+            // version and push it to all downstream poms so no manual updates
+            // are ever needed between release cycles.
             updateDependentPoms(path, submoduleDir, submodulePaths, parentDir);
         }
 
@@ -224,9 +263,9 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
     /**
      * Returns true if the given pom.xml contains a -SNAPSHOT version string.
      *
-     * This is our signal that the submodule still needs to be released.
-     * unleash itself does the proper version bumping — we just use this
-     * as a quick filter to skip already-released modules.
+     * Used as a quick filter to skip modules that are already on a release
+     * version. Unleash handles the actual version logic — we just check
+     * whether this module needs to be released at all.
      */
     private boolean needsRelease(File pom) throws MojoExecutionException {
         try {
@@ -239,16 +278,26 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
     }
 
     /**
-     * Spawns a new Maven process to run "mvn unleash:perform" inside the
-     * given submodule directory, using Maven Invoker.
+     * Spawns a child Maven process to run "mvn unleash:perform" in the
+     * given submodule directory using Maven Invoker.
      *
-     * Key configuration:
-     * - setBatchMode(true)            → disables interactive version prompts (-B flag)
-     * - setLocalRepositoryDirectory() → child Maven uses same local .m2 cache,
-     *                                   so it finds unleash-submodule-extension
-     *                                   which isn't published to Maven Central
-     * - UNLEASH_ORCHESTRATED=true     → env var tells child to skip orchestration
-     *                                   (prevents infinite loop)
+     * Key configuration decisions:
+     *
+     * setBatchMode(true)
+     *   Equivalent to mvn -B. Without this, unleash's calculateVersions
+     *   step prompts interactively for the release version. The child has
+     *   no terminal attached so it would hang forever waiting for input.
+     *
+     * setLocalRepositoryDirectory()
+     *   The child Maven is a completely fresh JVM. Without this, it would
+     *   try to download unleash-submodule-extension from Maven Central
+     *   where it does not exist (it is only in the local ~/.m2 repository).
+     *
+     * UNLEASH_ORCHESTRATED=true (env var, not Maven property)
+     *   Prevents the child from orchestrating again (infinite loop guard).
+     *   Maven properties via setProperties() are user properties, not JVM
+     *   system properties — System.getProperty() cannot read them in a
+     *   forked process. Environment variables are reliably inherited.
      */
     private void triggerRelease(File directory)
             throws MojoFailureException, MojoExecutionException {
@@ -256,38 +305,25 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
         InvocationRequest request = new DefaultInvocationRequest();
         request.setBaseDirectory(directory);
         request.setGoals(Arrays.asList("unleash:perform"));
-
-        // Batch mode: without this, calculateVersions hangs waiting for
-        // keyboard input (release version prompt) since there's no terminal
         request.setBatchMode(true);
 
         Properties props = new Properties();
         props.setProperty("unleash.scmUsername", this.scmUsername);
         props.setProperty("unleash.scmPassword", this.scmPassword);
 
-        // Pass workflow file if it exists in the submodule directory
         File workflowFile = new File(directory, "submodule-workflow.wf");
         if (workflowFile.exists()) {
             props.setProperty("workflow", workflowFile.getAbsolutePath());
         }
         request.setProperties(props);
 
-        // The child Maven process is a completely fresh JVM — it doesn't
-        // inherit the parent's resolved classpath. Without this, it would
-        // try to download unleash-submodule-extension from Maven Central
-        // and fail (it only exists in your local ~/.m2 repository)
         String localRepoPath = System.getProperty("maven.repo.local");
         if (localRepoPath == null) {
             localRepoPath = System.getProperty("user.home") + "/.m2/repository";
         }
         request.setLocalRepositoryDirectory(new File(localRepoPath));
 
-        // Environment variable (not Maven property) — the only reliable way
-        // to pass a flag to a forked JVM. System.getenv() reads this;
-        // System.getProperty() would NOT work here.
         request.addShellEnvironment("UNLEASH_ORCHESTRATED", "true");
-
-        // Stream child Maven output into our own log with [SUB] prefix
         request.setOutputHandler(line -> this.log.info("  [SUB] " + line));
 
         Invoker invoker = new DefaultInvoker();
@@ -306,14 +342,14 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
     }
 
     /**
-     * Reads .gitmodules and extracts the submodule path values.
+     * Reads .gitmodules and extracts the path value for each submodule.
      *
      * .gitmodules format:
      *   [submodule "poc-util"]
-     *       path = poc-util          ← we extract this
+     *       path = poc-util          ← extracted
      *       url  = https://github.com/...
      *
-     * Returns: ["poc-util", "poc-service"]
+     * Returns: ["poc-util", "poc-service", "poc-api"]
      */
     private List<String> readSubmodulePaths(File gitmodules)
             throws MojoExecutionException {
@@ -333,23 +369,27 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
     }
 
     /**
-     * Challenge 3 — Cross-repo dependency version update.
+     * POST-RELEASE: updates all downstream modules to reference the new dev
+     * SNAPSHOT version of the just-released module.
      *
-     * After a submodule releases, other submodules may still reference it
-     * as a SNAPSHOT in their pom.xml. This method:
-     *   1. Identifies the just-released submodule's artifactId
-     *   2. Scans every other submodule's pom.xml for a SNAPSHOT reference to it
-     *   3. Replaces X.Y.Z-SNAPSHOT → X.Y.Z
-     *   4. Commits and pushes the change so it's visible to subsequent release steps
+     * WHY THIS IS NEEDED:
+     *   After poc-service releases 1.0.6, unleash bumps it to 1.0.7-SNAPSHOT.
+     *   Any module that depended on poc-service (e.g. poc-api) may still have
+     *   an outdated reference — either a stale release version (1.0.5) or
+     *   the previous SNAPSHOT (1.0.6-SNAPSHOT).
      *
-     * NOTE: This only updates SNAPSHOT references. If a pom already pins
-     * a release version (e.g. 1.0.1), it is left untouched — you must
-     * manually update it to the new SNAPSHOT before the next release cycle.
+     *   This method reads the NEW dev version from the released pom (1.0.7-SNAPSHOT)
+     *   and replaces whatever version downstream modules currently have — no
+     *   manual pom updates are ever needed between release cycles.
      *
-     * Example:
-     *   poc-util just released 1.0.2
-     *   poc-service/pom.xml has: <version>1.0.2-SNAPSHOT</version>
-     *   → after this method:     <version>1.0.2</version>  + commit + push
+     * WHAT IT REPLACES:
+     *   Any version (SNAPSHOT or release) → new dev SNAPSHOT
+     *   e.g. poc-api has poc-service:1.0.5   → updated to poc-service:1.0.7-SNAPSHOT
+     *   e.g. poc-api has poc-service:1.0.6-SNAPSHOT → updated to poc-service:1.0.7-SNAPSHOT
+     *
+     * After this update, the next release cycle's updateSubmoduleDepsBeforeRelease()
+     * will find poc-service:1.0.7-SNAPSHOT in poc-api and correctly resolve it
+     * to poc-service:1.0.7 before releasing poc-api.
      */
     private void updateDependentPoms(String releasedPath, File releasedDir,
                                      List<String> allPaths, File parentDir)
@@ -358,7 +398,6 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
         File releasedPom = new File(releasedDir, "pom.xml");
         if (!releasedPom.exists()) return;
 
-        // Read the released module's artifactId so we know what to search for
         String[] ga;
         try {
             ga = extractGroupArtifact(releasedPom);
@@ -370,7 +409,18 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
 
         String releasedArtifactId = ga[1];
 
-        // Scan every other submodule's pom.xml for a SNAPSHOT reference
+        // Read the new dev SNAPSHOT version unleash just committed into the pom.
+        // e.g. poc-service just released 1.0.6 → pom now shows 1.0.7-SNAPSHOT
+        String newSnapshotVersion = extractCurrentVersion(releasedPom);
+        if (newSnapshotVersion == null) {
+            this.log.warn("  [POST-RELEASE] Could not read new version from "
+                    + releasedPom + " — skipping downstream update");
+            return;
+        }
+        this.log.info("  [POST-RELEASE] " + releasedArtifactId
+                + " bumped to: " + newSnapshotVersion
+                + " — updating downstream modules");
+
         for (String otherPath : allPaths) {
             if (otherPath.equals(releasedPath)) continue;
 
@@ -380,17 +430,21 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
 
             try {
                 String content = new String(Files.readAllBytes(otherPom.toPath()));
-                String updated = replaceSnapshotVersion(content, releasedArtifactId);
+
+                // Replace whatever version the downstream module currently has
+                // for this dependency — could be a stale release or old SNAPSHOT
+                String updated = replaceAnyVersion(content, releasedArtifactId,
+                        newSnapshotVersion);
 
                 if (!updated.equals(content)) {
                     Files.write(otherPom.toPath(), updated.getBytes());
                     this.log.info("  📝 Updated " + otherPath + "/pom.xml"
                             + " — " + releasedArtifactId
-                            + " SNAPSHOT → release version");
-
+                            + " → " + newSnapshotVersion);
                     commitAndPush(otherDir,
                             "[unleash-release] update " + releasedArtifactId
-                                    + " dependency to release version");
+                                    + " to " + newSnapshotVersion
+                                    + " for next dev cycle");
                 }
             } catch (IOException e) {
                 throw new MojoExecutionException(
@@ -400,22 +454,137 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
     }
 
     /**
-     * String-based replacement of a SNAPSHOT dependency version in a pom.xml.
+     * PRE-RELEASE: updates SNAPSHOT sibling dependencies in a module's pom
+     * to their computed release versions, before that module is released.
      *
-     * Splits on the given artifactId tag, then looks in the next ~200 characters
-     * (staying inside the same dependency block) for a version ending in -SNAPSHOT.
-     * Strips the -SNAPSHOT suffix to produce the release version.
+     * WHY THIS IS NEEDED:
+     *   poc-service depends on poc-util:1.0.6-SNAPSHOT.
+     *   Unleash's checkDependencies step REJECTS any release containing SNAPSHOT
+     *   deps. So the version must be resolved to a release version first.
      *
-     * Example transform:
+     * HOW WE KNOW THE RELEASE VERSION:
+     *   We read the sibling's current pom. If poc-util shows 1.0.6-SNAPSHOT,
+     *   its release version will be 1.0.6 (unleash always strips -SNAPSHOT).
+     *   We make this replacement before triggering the release.
+     *
+     * NOTE: Only SNAPSHOT versions are replaced here. Release versions (e.g.
+     *   1.0.5) are left alone — they are already valid for checkDependencies.
+     *   The POST-RELEASE step (updateDependentPoms) ensures that after each
+     *   release, all downstream poms are updated to the new SNAPSHOT, so the
+     *   next cycle's PRE-RELEASE step always finds a SNAPSHOT to work with.
+     *
+     * Example:
+     *   poc-util is currently 1.0.6-SNAPSHOT → will release as 1.0.6
+     *   poc-service/pom.xml: poc-util:1.0.6-SNAPSHOT → poc-util:1.0.6
+     *   → committed and pushed → THEN poc-service is released cleanly ✅
+     */
+    private void updateSubmoduleDepsBeforeRelease(File submoduleDir,
+                                                  List<String> allPaths,
+                                                  File parentDir)
+            throws MojoExecutionException, MojoFailureException {
+
+        File pomToUpdate = new File(submoduleDir, "pom.xml");
+        if (!pomToUpdate.exists()) return;
+
+        this.log.info("  [PRE-RELEASE] Checking " + submoduleDir.getName()
+                + "/pom.xml for SNAPSHOT deps on sibling submodules...");
+
+        boolean anyUpdated = false;
+
+        for (String siblingPath : allPaths) {
+            File siblingDir = new File(parentDir, siblingPath);
+
+            // Skip self
+            String submoduleAbs;
+            String siblingAbs;
+            try {
+                submoduleAbs = submoduleDir.getCanonicalPath();
+                siblingAbs   = siblingDir.getCanonicalPath();
+            } catch (IOException e) {
+                submoduleAbs = submoduleDir.getAbsolutePath();
+                siblingAbs   = siblingDir.getAbsolutePath();
+            }
+            if (submoduleAbs.equals(siblingAbs)) continue;
+
+            File siblingPom = new File(siblingDir, "pom.xml");
+            if (!siblingPom.exists()) continue;
+
+            String siblingArtifactId;
+            String siblingReleaseVersion;
+            try {
+                String[] ga = extractGroupArtifact(siblingPom);
+                if (ga == null) continue;
+                siblingArtifactId = ga[1];
+
+                String siblingPomContent = new String(
+                        Files.readAllBytes(siblingPom.toPath()));
+
+                // Only act if the sibling is on a SNAPSHOT — release versions
+                // don't need updating since checkDependencies accepts them
+                java.util.regex.Matcher versionMatcher =
+                        java.util.regex.Pattern
+                                .compile("<version>([0-9]+\\.[0-9]+\\.[0-9]+)-SNAPSHOT</version>")
+                                .matcher(siblingPomContent);
+
+                if (!versionMatcher.find()) {
+                    continue; // sibling is already on a release version
+                }
+                siblingReleaseVersion = versionMatcher.group(1);
+
+            } catch (IOException e) {
+                throw new MojoExecutionException(
+                        "Cannot read sibling pom: " + siblingPom, e);
+            }
+
+            this.log.info("  [PRE-RELEASE] Sibling [" + siblingArtifactId
+                    + "] will release as: " + siblingReleaseVersion);
+
+            try {
+                String content = new String(Files.readAllBytes(pomToUpdate.toPath()));
+                // Replace X.Y.Z-SNAPSHOT → X.Y.Z for this sibling's artifactId
+                String updated = replaceSnapshotVersion(content, siblingArtifactId);
+
+                if (!updated.equals(content)) {
+                    Files.write(pomToUpdate.toPath(), updated.getBytes());
+                    this.log.info("  [PRE-RELEASE] ✅ Updated "
+                            + submoduleDir.getName() + "/pom.xml: "
+                            + siblingArtifactId + " SNAPSHOT → "
+                            + siblingReleaseVersion);
+                    commitAndPush(submoduleDir,
+                            "[unleash-release] update " + siblingArtifactId
+                                    + " dependency to " + siblingReleaseVersion
+                                    + " before release");
+                    anyUpdated = true;
+                }
+            } catch (IOException e) {
+                throw new MojoExecutionException(
+                        "Cannot update pom.xml in " + submoduleDir.getName(), e);
+            }
+        }
+
+        if (!anyUpdated) {
+            this.log.info("  [PRE-RELEASE] No SNAPSHOT sibling deps found — pom is clean ✅");
+        }
+    }
+
+    /**
+     * Replaces a SNAPSHOT dependency version with its release version.
+     *
+     * Splits the pom content on the artifactId tag, then looks ahead 200 chars
+     * (staying inside the same dependency block) for a -SNAPSHOT version and
+     * strips the suffix.
+     *
+     * Used by PRE-RELEASE (updateSubmoduleDepsBeforeRelease) only.
+     *
+     * Example:
      *   BEFORE:  <artifactId>poc-util</artifactId>
-     *            <version>1.0.2-SNAPSHOT</version>
-     *
+     *            <version>1.0.6-SNAPSHOT</version>
      *   AFTER:   <artifactId>poc-util</artifactId>
-     *            <version>1.0.2</version>
+     *            <version>1.0.6</version>
      *
      * Why string replacement and not DOM parsing?
-     * DOM parsing and re-serialization destroys XML formatting and comments.
-     * String replacement is simpler and preserves the original file structure.
+     * DOM re-serialisation destroys XML formatting, indentation and comments.
+     * String replacement preserves the original file structure exactly.
      */
     private String replaceSnapshotVersion(String pomContent, String artifactId) {
         String[] parts = pomContent.split(
@@ -430,13 +599,10 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
             result.append("<artifactId>").append(artifactId).append("</artifactId>");
 
             String following = parts[i];
-            // Only look ahead 200 chars — avoids replacing versions in
-            // unrelated dependency blocks that happen to have the same artifactId
             String lookAhead = following.length() > 200
                     ? following.substring(0, 200) : following;
 
             if (lookAhead.contains("-SNAPSHOT</version>")) {
-                // Strip -SNAPSHOT from the version tag: 1.0.2-SNAPSHOT → 1.0.2
                 result.append(following.replaceFirst(
                         "([0-9]+\\.[0-9]+\\.[0-9]+)-SNAPSHOT</version>",
                         "$1</version>"));
@@ -444,19 +610,97 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
                 result.append(following);
             }
         }
-
         return result.toString();
     }
 
     /**
-     * Stages all modified files in the given repo, commits with the given message,
-     * and pushes to the remote using the injected SCM credentials.
+     * Replaces a dependency version with a new version — regardless of what
+     * the current version is (SNAPSHOT or release).
      *
-     * Used after pom.xml cross-dependency updates so the changes are visible
-     * to unleash's own storeScmRevision and checkForScmChanges steps.
+     * Used by POST-RELEASE (updateDependentPoms) to push the new dev SNAPSHOT
+     * to downstream modules after a release completes.
      *
-     * Uses JGit (already on the classpath via unleash-scm-provider-git)
-     * — no extra dependency needed.
+     * Unlike replaceSnapshotVersion() which only targets -SNAPSHOT versions,
+     * this replaces ANY version string found after the artifactId tag.
+     *
+     * Example:
+     *   artifactId = poc-service, newVersion = 1.0.7-SNAPSHOT
+     *
+     *   BEFORE:  <artifactId>poc-service</artifactId>
+     *            <version>1.0.5</version>              ← stale release version
+     *   AFTER:   <artifactId>poc-service</artifactId>
+     *            <version>1.0.7-SNAPSHOT</version>     ← new dev version
+     *
+     *   OR:
+     *   BEFORE:  <version>1.0.6-SNAPSHOT</version>     ← old SNAPSHOT
+     *   AFTER:   <version>1.0.7-SNAPSHOT</version>     ← new dev version
+     */
+    private String replaceAnyVersion(String pomContent, String artifactId,
+                                     String newVersion) {
+        String[] parts = pomContent.split(
+                "<artifactId>" + artifactId + "</artifactId>");
+
+        if (parts.length < 2) return pomContent;
+
+        StringBuilder result = new StringBuilder();
+        result.append(parts[0]);
+
+        for (int i = 1; i < parts.length; i++) {
+            result.append("<artifactId>").append(artifactId).append("</artifactId>");
+
+            String following = parts[i];
+            String lookAhead = following.length() > 200
+                    ? following.substring(0, 200) : following;
+
+            if (lookAhead.contains("<version>")) {
+                // Replace whatever version is there with the new SNAPSHOT
+                result.append(following.replaceFirst(
+                        "<version>[^<]+</version>",
+                        "<version>" + newVersion + "</version>"));
+            } else {
+                result.append(following);
+            }
+        }
+        return result.toString();
+    }
+
+    /**
+     * Reads the current <version> of a project from its pom.xml using XPath.
+     *
+     * Called AFTER a submodule releases. At that point, unleash has already
+     * committed the bumped dev version into the pom (e.g. 1.0.7-SNAPSHOT).
+     * We read it here so we can automatically propagate it to downstream modules.
+     *
+     * Returns null if the version cannot be read — caller handles the warning.
+     */
+    private String extractCurrentVersion(File pom) throws MojoExecutionException {
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            DocumentBuilder builder = factory.newDocumentBuilder();
+            builder.setErrorHandler(null);
+            Document doc = builder.parse(pom);
+            XPath xpath = XPathFactory.newInstance().newXPath();
+            String version = (String) xpath.evaluate(
+                    "/project/version", doc, XPathConstants.STRING);
+            if (version != null && !version.trim().isEmpty()) {
+                return version.trim();
+            }
+        } catch (Exception e) {
+            throw new MojoExecutionException(
+                    "Cannot read version from pom: " + pom, e);
+        }
+        return null;
+    }
+
+    /**
+     * Commits and pushes all modified files in the given repo using JGit.
+     *
+     * Used after every pom.xml update — both PRE-RELEASE and POST-RELEASE —
+     * so that unleash's own storeScmRevision and checkForScmChanges steps
+     * always see a clean, consistent repository state.
+     *
+     * JGit is available at runtime as a transitive dependency of
+     * unleash-scm-provider-git — no extra pom dependency needed.
      */
     private void commitAndPush(File repoDir, String message)
             throws MojoExecutionException {
@@ -481,8 +725,10 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
 
     /**
      * Parses a pom.xml and returns [groupId, artifactId] of the project.
-     * Falls back to parent groupId if the project doesn't declare its own
-     * (common in multi-module Maven projects).
+     * Falls back to parent/groupId if the project does not declare its own
+     * (standard Maven inheritance pattern).
+     *
+     * Returns null if neither can be found.
      */
     private String[] extractGroupArtifact(File pom) throws MojoExecutionException {
         try {
@@ -510,122 +756,5 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
                     "Cannot parse pom.xml: " + pom, e);
         }
         return null;
-    }
-
-    /**
-     * Before releasing a submodule, updates any SNAPSHOT dependencies it has
-     * on OTHER sibling submodules, replacing them with the computed release version.
-     *
-     * WHY THIS IS NEEDED:
-     *   poc-service depends on poc-util:1.0.4-SNAPSHOT
-     *   unleash's checkDependencies step REJECTS any release that contains SNAPSHOT deps
-     *   So we must update poc-service's pom BEFORE triggering its release
-     *
-     * HOW WE KNOW THE RELEASE VERSION:
-     *   We don't need poc-util to be released yet — we just read its current pom.
-     *   If poc-util is currently 1.0.4-SNAPSHOT, its release version will be 1.0.4.
-     *   This is exactly what unleash itself will do when it releases poc-util.
-     *
-     * Example:
-     *   poc-util current version: 1.0.4-SNAPSHOT  → release version = 1.0.4
-     *   poc-service/pom.xml has:  poc-util:1.0.4-SNAPSHOT
-     *   → updated to:             poc-util:1.0.4
-     *   → committed and pushed
-     *   → THEN poc-service is released cleanly
-     */
-    private void updateSubmoduleDepsBeforeRelease(File submoduleDir,
-                                                  List<String> allPaths, File parentDir)
-            throws MojoExecutionException, MojoFailureException {
-
-        File pomToUpdate = new File(submoduleDir, "pom.xml");
-        if (!pomToUpdate.exists()) return;
-
-        this.log.info("  [PRE-RELEASE] Checking " + submoduleDir.getName()
-                + "/pom.xml for SNAPSHOT deps on sibling submodules...");
-
-        boolean anyUpdated = false;
-
-        // For each sibling submodule, check if it is referenced as SNAPSHOT
-        // in the submodule we are about to release
-        for (String siblingPath : allPaths) {
-            File siblingDir = new File(parentDir, siblingPath);
-
-            // Skip self — don't update a module's dependency on itself
-            String submoduleAbs;
-            String siblingAbs;
-            try {
-                submoduleAbs = submoduleDir.getCanonicalPath();
-                siblingAbs   = siblingDir.getCanonicalPath();
-            } catch (IOException e) {
-                submoduleAbs = submoduleDir.getAbsolutePath();
-                siblingAbs   = siblingDir.getAbsolutePath();
-            }
-            if (submoduleAbs.equals(siblingAbs)) continue;
-
-            File siblingPom = new File(siblingDir, "pom.xml");
-            if (!siblingPom.exists()) continue;
-
-            // Read the sibling's current version (e.g. 1.0.4-SNAPSHOT)
-            // and compute what its release version will be (e.g. 1.0.4)
-            String siblingArtifactId;
-            String siblingReleaseVersion;
-            try {
-                String[] ga = extractGroupArtifact(siblingPom);
-                if (ga == null) continue;
-                siblingArtifactId = ga[1];
-
-                String siblingPomContent = new String(
-                        Files.readAllBytes(siblingPom.toPath()));
-
-                // Extract current version from sibling pom
-                // e.g. <version>1.0.4-SNAPSHOT</version>
-                java.util.regex.Matcher versionMatcher =
-                        java.util.regex.Pattern
-                                .compile("<version>([0-9]+\\.[0-9]+\\.[0-9]+)-SNAPSHOT</version>")
-                                .matcher(siblingPomContent);
-
-                if (!versionMatcher.find()) {
-                    // Sibling is already on a release version — nothing to update
-                    continue;
-                }
-                // Strip -SNAPSHOT to get the release version
-                siblingReleaseVersion = versionMatcher.group(1);
-
-            } catch (IOException e) {
-                throw new MojoExecutionException(
-                        "Cannot read sibling pom: " + siblingPom, e);
-            }
-
-            this.log.info("  [PRE-RELEASE] Sibling [" + siblingArtifactId
-                    + "] will release as: " + siblingReleaseVersion);
-
-            // Now update the pom of the submodule we're about to release
-            try {
-                String content = new String(Files.readAllBytes(pomToUpdate.toPath()));
-                String updated = replaceSnapshotVersion(content, siblingArtifactId);
-
-                if (!updated.equals(content)) {
-                    Files.write(pomToUpdate.toPath(), updated.getBytes());
-                    this.log.info("  [PRE-RELEASE] ✅ Updated "
-                            + submoduleDir.getName() + "/pom.xml: "
-                            + siblingArtifactId + " SNAPSHOT → "
-                            + siblingReleaseVersion);
-
-                    commitAndPush(submoduleDir,
-                            "[unleash-release] update " + siblingArtifactId
-                                    + " dependency to " + siblingReleaseVersion
-                                    + " before release");
-
-                    anyUpdated = true;
-                }
-            } catch (IOException e) {
-                throw new MojoExecutionException(
-                        "Cannot update pom.xml in " + submoduleDir.getName(), e);
-            }
-        }
-
-        if (!anyUpdated) {
-            this.log.info("  [PRE-RELEASE] No SNAPSHOT sibling deps found — pom is clean ✅");
-        }
     }
 }
