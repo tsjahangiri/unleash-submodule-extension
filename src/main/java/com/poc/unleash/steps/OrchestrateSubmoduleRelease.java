@@ -138,7 +138,29 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
         List<String> released = new ArrayList<>();
         List<String> skipped  = new ArrayList<>();
 
-        for (String path : submodulePaths) {
+        // ── FIND CURRENT MODULE INDEX ────────────────────────────────────
+        // We only orchestrate modules listed AFTER us in .gitmodules.
+        // Modules listed before us are upstream dependencies — they must
+        // not be re-released by a downstream module's orchestration run.
+        int currentIndex = -1;
+        for (int i = 0; i < submodulePaths.size(); i++) {
+            File candidate = new File(parentDir, submodulePaths.get(i).trim());
+            String candidateAbs;
+            try {
+                candidateAbs = candidate.getCanonicalPath();
+            } catch (IOException e) {
+                candidateAbs = candidate.getAbsolutePath();
+            }
+            if (candidateAbs.equals(currentAbsPath)) {
+                currentIndex = i;
+                break;
+            }
+        }
+        this.log.info("Current module index in .gitmodules: " + currentIndex
+                + " — will only orchestrate modules at index > " + currentIndex);
+
+        for (int i = 0; i < submodulePaths.size(); i++) {
+            String path = submodulePaths.get(i);
             File submoduleDir = new File(parentDir, path.trim());
 
             String submoduleAbsPath;
@@ -148,9 +170,20 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
                 submoduleAbsPath = submoduleDir.getAbsolutePath();
             }
 
+            // ── UPSTREAM SKIP ────────────────────────────────────────────
+            // Modules listed before the current module are upstream dependencies.
+            // They should already be released — do not re-release them.
+            // Example: running from poc-service (index 1) must not re-release
+            // poc-util (index 0) even if poc-util is still on a SNAPSHOT version.
+            if (i < currentIndex) {
+                this.log.info("  ⏭  Skipping [" + path
+                        + "] — upstream dependency (index " + i
+                        + " < current index " + currentIndex + ").");
+                skipped.add(path);
+                continue;
+            }
+
             // ── SELF-SKIP ────────────────────────────────────────────────
-            // Compare canonical paths — safer than comparing folder name strings
-            // because .gitmodules might format paths differently (e.g. ./poc-util)
             if (submoduleAbsPath.equals(currentAbsPath)) {
                 this.log.info("  ⏭  Skipping [" + path
                         + "] — this is the current project (self).");
@@ -166,8 +199,6 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
             }
 
             // ── ALREADY RELEASED? ────────────────────────────────────────
-            // If the submodule's pom.xml has no -SNAPSHOT, it's already on
-            // a release version — nothing to do
             if (!needsRelease(submodulePom)) {
                 this.log.info("  ⏭  Skipping [" + path
                         + "] — already at release version.");
@@ -177,17 +208,11 @@ public class OrchestrateSubmoduleRelease implements CDIMojoProcessingStep {
 
             // ── RELEASE ──────────────────────────────────────────────────
             this.log.info("  🚀 Releasing submodule: " + path);
-            // ✅ NEW: update any SNAPSHOT sibling deps in this submodule's pom
-            // BEFORE releasing — unleash rejects releases with SNAPSHOT dependencies
             updateSubmoduleDepsBeforeRelease(submoduleDir, submodulePaths, parentDir);
             triggerRelease(submoduleDir);
             released.add(path);
             this.log.info("  ✅ Done: " + path);
 
-            // ── CHALLENGE 3: UPDATE CROSS-REPO DEPS ──────────────────────
-            // After poc-util releases 1.0.2, any other submodule that still
-            // has <version>1.0.2-SNAPSHOT</version> for poc-util needs updating
-            // to <version>1.0.2</version> before they themselves release
             updateDependentPoms(path, submoduleDir, submodulePaths, parentDir);
         }
 
